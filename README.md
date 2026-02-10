@@ -155,9 +155,8 @@ Training time for 1000 samples:
 
 | Hardware | Training Time |
 |----------|---------------|
-| NVIDIA RTX 4090 | ~30 seconds |
-| Apple M3 Pro | ~60 seconds |
-| Intel i7 CPU | ~180 seconds |
+| NVIDIA RTX 5060(CUDA) | ~30 seconds |
+| Apple M3 Pro(MPS) | ~60 seconds |
 
 Model size: 100-500 MB (varies with training data size)
 
