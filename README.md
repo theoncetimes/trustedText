@@ -237,7 +237,7 @@ If you use TrustedText in your research or project, please cite:
 ```bibtex
 @misc{trustedtext2026,
     title={TrustedText: AI Text Detection using Neural Networks with Contrastive Learning},
-    author={TrustedText Contributors},
+    author={Timmy Wu and Matthew Hung},
     year={2026},
     publisher={GitHub},
     howpublished={\url{https://github.com/theoncetimes/trustedText}}
