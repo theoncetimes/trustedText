@@ -60,10 +60,6 @@ Text: """
     contrastive_weight: float = 0.5  # Weight for contrastive loss vs classification loss
     temperature: float = 0.1  # For contrastive loss
     
-    # Feature flags
-    use_stylometric: bool = False
-    use_contrastive: bool = True
-    
     def __post_init__(self):
         load_dotenv()
         self.max_seq_len = int(os.getenv("MAX_SEQ_LEN", self.max_seq_len))
@@ -89,81 +85,11 @@ class DeviceManager:
             logger.info("No GPU detected, using CPU")
         return device
 
-
-class StylometricFeatures:
-    """Extract writing style features to distinguish AI from human text."""
-    
-    @staticmethod
-    def extract(texts: List[str]) -> np.ndarray:
-        """
-        Extract stylometric features for each text.
-        Returns array of shape (n_samples, n_features)
-        """
-        features = []
-        
-        for text in texts:
-            feat = []
-            
-            # Basic stats
-            words = text.split()
-            sentences = [s.strip() for s in text.replace('?', '.').replace('!', '.').split('.') if s.strip()]
-            
-            # 1. Text length features
-            feat.append(len(words))
-            feat.append(len(text))
-            
-            # 2. Sentence length statistics (burstiness indicator)
-            sent_lengths = [len(s.split()) for s in sentences] if sentences else [0]
-            feat.append(np.mean(sent_lengths))
-            feat.append(np.std(sent_lengths) if len(sent_lengths) > 1 else 0)
-            
-            # 3. Lexical diversity (AI tends to be more repetitive)
-            unique_words = set(w.lower() for w in words)
-            lexical_div = len(unique_words) / max(len(words), 1)
-            feat.append(lexical_div)
-            
-            # 4. Character-level diversity
-            chars = list(text)
-            unique_chars = set(chars)
-            char_div = len(unique_chars) / max(len(chars), 1)
-            feat.append(char_div)
-            
-            # 5. Punctuation patterns
-            punct_counts = {
-                ',': text.count(','),
-                ';': text.count(';'),
-                ':': text.count(':'),
-                '-': text.count('-'),
-                '"': text.count('"') + text.count('"'),
-                "'": text.count("'"),
-            }
-            total_punct = sum(punct_counts.values())
-            feat.append(total_punct / max(len(words), 1))  # Punctuation density
-            
-            # 6. Function word density (AI overuses certain connectors)
-            function_words = ['the', 'and', 'that', 'this', 'with', 'for', 'as', 'to', 'of', 'in']
-            func_count = sum(1 for w in words if w.lower() in function_words)
-            feat.append(func_count / max(len(words), 1))
-            
-            # 7. Average word length
-            word_lengths = [len(w) for w in words]
-            feat.append(np.mean(word_lengths) if word_lengths else 0)
-            feat.append(np.std(word_lengths) if len(word_lengths) > 1 else 0)
-            
-            # 8. Paragraph structure (newlines)
-            paragraphs = [p for p in text.split('\n\n') if p.strip()]
-            feat.append(len(paragraphs))
-            
-            features.append(feat)
-            
-        return np.array(features, dtype=np.float32)
-
-
 # ────────────────────────────────────────────────
 # EMBEDDING WITH STYLE
 # ────────────────────────────────────────────────
 class Embedding:
-    """Manages the sentence transformer model and text encoding with stylometric features."""
+    """Manages the sentence transformer model and text encoding."""
     
     def __init__(self, config: Config, device: str):
         self.config = config
@@ -171,7 +97,6 @@ class Embedding:
         self.model: Optional[SentenceTransformer] = None
         self._embedding_dim: Optional[int] = None
         self._semantic_dim: Optional[int] = None
-        self.stylo_extractor = StylometricFeatures()
         
     def load(self) -> None:
         """Load the sentence transformer model."""
@@ -196,7 +121,7 @@ class Embedding:
     
     def encode(self, texts: List[str], show_progress: bool = False) -> np.ndarray:
         """
-        Encode texts with semantic + stylometric features.
+        Encode texts with semantic embeddings.
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -224,26 +149,9 @@ class Embedding:
                 
         semantic_embeddings = np.vstack(semantic_embeddings).astype(np.float32)
         
-        if not self.config.use_stylometric:
-            self._embedding_dim = self._semantic_dim
-            return semantic_embeddings
-            
-        # Stylometric features
-        style_features = self.stylo_extractor.extract(texts)
-        
-        # Normalize style features (z-score)
-        style_mean = np.mean(style_features, axis=0)
-        style_std = np.std(style_features, axis=0) + 1e-8
-        style_features = (style_features - style_mean) / style_std
-        
-        # Concatenate
-        combined = np.hstack([semantic_embeddings, style_features])
-        self._embedding_dim = combined.shape[1]
-        
-        logger.info(f"Combined embedding dim: {self._embedding_dim} "
-                   f"(Semantic: {self._semantic_dim}, Style: {style_features.shape[1]})")
-        
-        return combined
+        self._embedding_dim = self._semantic_dim
+
+        return semantic_embeddings
 
 
 # ────────────────────────────────────────────────
@@ -448,11 +356,8 @@ class NeuralClassifier:
                 # Combined loss
                 ce_loss = (criterion(logits, batch_y) * batch_w).mean()
                 
-                if self.config.use_contrastive:
-                    contr_loss = self._contrastive_loss(emb, batch_y, self.config.temperature)
-                    loss = ce_loss + self.config.contrastive_weight * contr_loss
-                else:
-                    loss = ce_loss
+                contr_loss = self._contrastive_loss(emb, batch_y, self.config.temperature)
+                loss = ce_loss + self.config.contrastive_weight * contr_loss
                 
                 loss.backward()
                 optimizer.step()
@@ -593,7 +498,6 @@ class Storage:
             "files": file_stats,
             "instruction": self.config.instruction,
             "model_id": self.config.model_id,
-            "use_stylometric": self.config.use_stylometric,
         }
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         return digest
@@ -757,7 +661,6 @@ class TrustedText:
             self.storage.load_or_create_embeddings(self.embedding)
         
         logger.info(f"Dataset ready: Human={self.human_count}, AI={self.ai_count}")
-        logger.info(f"Using {self.config.use_stylometric and 'semantic + stylometric' or 'semantic only'} features")
         
         min_class_count = min(self.human_count, self.ai_count)
         self.classifier.validate(self.embeddings, self.labels, min_class_count)
@@ -819,8 +722,7 @@ class TrustedText:
         )
         
         plt.colorbar(scatter, label='Class (0=Human, 1=AI)')
-        plt.title(f"{method.upper()} of Embeddings (Blue=Human, Red=AI)\n"
-                 f"{'Stylometric + ' if self.config.use_stylometric else ''}Semantic Features")
+        plt.title(f"{method.upper()} of Embeddings (Blue=Human, Red=AI)")
         plt.xlabel("Component 1")
         plt.ylabel("Component 2")
         plt.tight_layout()
@@ -862,10 +764,6 @@ class TrustedText:
         metadata = {
             "human_count": self.human_count,
             "ai_count": self.ai_count,
-            "config": {
-                "use_stylometric": self.config.use_stylometric,
-                "use_contrastive": self.config.use_contrastive,
-            }
         }
         self.classifier.save(path, metadata)
         return path
@@ -945,21 +843,10 @@ class TrustedText:
         """Detailed analysis of a single text."""
         label, prob = self.predict(text, return_prob=True)
         
-        # Get stylometric features for explanation
-        style_features = StylometricFeatures.extract([text])[0]
-        feature_names = [
-            'word_count', 'char_count', 'avg_sent_len', 'sent_len_std',
-            'lexical_diversity', 'char_diversity', 'punct_density',
-            'function_word_ratio', 'avg_word_len', 'word_len_std', 'paragraph_count'
-        ]
-        
         return {
             'prediction': label,
             'ai_probability': prob,
             'human_probability': 1 - prob,
-            'stylometric_features': {
-                name: float(val) for name, val in zip(feature_names, style_features)
-            },
             'confidence': 'High' if abs(prob - 0.5) > 0.4 else 'Medium' if abs(prob - 0.5) > 0.2 else 'Low'
         }
 
@@ -967,8 +854,6 @@ class TrustedText:
 if __name__ == "__main__":
     # Configuration
     config = Config(
-        use_stylometric=True,  # Enable style features for better separation
-        use_contrastive=True,  # Enable contrastive learning
         epochs=100,
         hidden_dim=512
     )

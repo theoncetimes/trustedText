@@ -29,7 +29,6 @@ scaler_std = None
 instruction = None
 hyperparams = {}
 metadata = {}
-use_stylometric = True
 
 # Request/Response models
 class TextRequest(BaseModel):
@@ -40,66 +39,6 @@ class DetectionResponse(BaseModel):
     ai_probability: float
     confidence: str
     processing_time_ms: float
-
-class StylometricFeatures:
-    """Extract writing style features"""
-    
-    @staticmethod
-    def extract(texts):
-        features = []
-        for text in texts:
-            feat = []
-            words = text.split()
-            sentences = [s.strip() for s in text.replace('?', '.').replace('!', '.').split('.') if s.strip()]
-            
-            # 1. Text length features
-            feat.append(len(words))
-            feat.append(len(text))
-            
-            # 2. Sentence length statistics
-            sent_lengths = [len(s.split()) for s in sentences] if sentences else [0]
-            feat.append(np.mean(sent_lengths))
-            feat.append(np.std(sent_lengths) if len(sent_lengths) > 1 else 0)
-            
-            # 3. Lexical diversity
-            unique_words = set(w.lower() for w in words)
-            lexical_div = len(unique_words) / max(len(words), 1)
-            feat.append(lexical_div)
-            
-            # 4. Character-level diversity
-            chars = list(text)
-            unique_chars = set(chars)
-            char_div = len(unique_chars) / max(len(chars), 1)
-            feat.append(char_div)
-            
-            # 5. Punctuation patterns (match training exactly)
-            punct_counts = {
-                ',': text.count(','),
-                ';': text.count(';'),
-                ':': text.count(':'),
-                '-': text.count('-'),
-                '"': text.count('"') + text.count('"'),
-                "'": text.count("'"),
-            }
-            total_punct = sum(punct_counts.values())
-            feat.append(total_punct / max(len(words), 1))
-            
-            # 6. Function word density
-            function_words = ['the', 'and', 'that', 'this', 'with', 'for', 'as', 'to', 'of', 'in']
-            func_count = sum(1 for w in words if w.lower() in function_words)
-            feat.append(func_count / max(len(words), 1))
-            
-            # 7. Average word length
-            word_lengths = [len(w) for w in words]
-            feat.append(np.mean(word_lengths) if word_lengths else 0)
-            feat.append(np.std(word_lengths) if len(word_lengths) > 1 else 0)
-            
-            # 8. Paragraph structure (MISSING IN API!)
-            paragraphs = [p for p in text.split('\n\n') if p.strip()]
-            feat.append(len(paragraphs))
-            
-            features.append(feat)
-        return np.array(features, dtype=np.float32)
 
 class ContrastiveClassifier(torch.nn.Module):
     """Neural network for classification with optional projection layer"""
@@ -140,7 +79,7 @@ class ContrastiveClassifier(torch.nn.Module):
 @app.on_event("startup")
 async def load_model():
     """Load the trained neural model on startup"""
-    global model, classifier_model, scaler_mean, scaler_std, instruction, hyperparams, metadata, use_stylometric
+    global model, classifier_model, scaler_mean, scaler_std, instruction, hyperparams, metadata
     
     print("Loading model...")
     
@@ -193,7 +132,6 @@ async def load_model():
     )
     model_id = checkpoint.get("model_id", "Qwen/Qwen3-Embedding-0.6B")
     max_seq_len = int(checkpoint.get("max_seq_length", os.getenv("MAX_SEQ_LEN", "320")))
-    use_stylometric = checkpoint.get("config", {}).get("use_stylometric", True)
 
     # Check if model has projection layer and infer its dimensions from state dict
     state_dict = checkpoint["model_state"]
@@ -231,27 +169,15 @@ async def load_model():
 
     print("Model loaded successfully")
     print(f"Training samples: {metadata.get('human_count', 0)} human, {metadata.get('ai_count', 0)} AI")
-    print(f"Features: {'Semantic + Stylometric' if use_stylometric else 'Semantic only'}")
 
 def encode_text(text: str):
-    """Encode text with semantic and optional stylometric features"""
+    """Encode text with semantic embeddings"""
     # Semantic embedding
     prompt = instruction + text
     semantic_emb = model.encode([prompt], normalize_embeddings=True, convert_to_tensor=False)
     semantic_emb = np.array(semantic_emb, dtype=np.float32)
     
-    if not use_stylometric:
-        return semantic_emb[0]
-    
-    # Stylometric features
-    style_features = StylometricFeatures.extract([text])
-    style_mean = np.mean(style_features, axis=0)
-    style_std = np.std(style_features, axis=0) + 1e-8
-    style_features = (style_features - style_mean) / style_std
-    
-    # Concatenate
-    combined = np.hstack([semantic_emb, style_features])
-    return combined[0]
+    return semantic_emb[0]
 
 def predict_text(text: str):
     """Make prediction on text"""
