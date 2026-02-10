@@ -1,69 +1,36 @@
-# TrustedText - AI Text Detection
+# TrustedText
 
-A high-performance AI text detection system using neural networks with contrastive learning. Supports training on NVIDIA GPUs, Apple Silicon (MPS), or CPU.
+> High-performance AI text detection using neural networks with contrastive learning
 
-## Features
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-- **Neural Architecture**: Deep learning classifier with contrastive learning for robust detection
-- **Multi-GPU Support**: Automatically detects and uses NVIDIA CUDA, Apple MPS, or CPU
-- **Transfer Learning**: Train on powerful GPU machines and transfer models easily
-- **Hard Negative Mining**: Automatically identifies and emphasizes difficult examples during training
-- **Contrastive Learning**: Learns discriminative representations by pulling same-class samples together
-- **Embeddings Cache**: Speeds up repeated training with cached embeddings
-- **Cross-Validation**: Built-in evaluation metrics and test set support
+TrustedText is a robust AI text detection system that uses deep learning to distinguish between human-written and AI-generated content. Built with neural networks and contrastive learning, it provides accurate detection with support for NVIDIA GPUs, Apple Silicon, and CPU training.
+
+## Why TrustedText?
+
+- **State-of-the-art Detection**: Neural architecture with contrastive learning for robust AI text identification
+- **Flexible Hardware Support**: Automatically detects and optimizes for NVIDIA CUDA, Apple MPS, or CPU
+- **Production Ready**: Train once on powerful hardware, deploy anywhere
+- **Easy to Use**: Simple API for both training and inference
 
 ## Quick Start
 
-### 1. Installation
-
-**⚠️ IMPORTANT for RTX 50-series GPUs (5060, 5070, 5080, 5090):**  
-See [GPU_SETUP.md](docs/GPU_SETUP.md) for detailed GPU setup instructions.
+### Installation
 
 ```bash
-# For NVIDIA RTX 50-series (Blackwell - CUDA 12.8+)
-# DO NOT install torchvision - it causes conflicts!
-pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Install PyTorch (choose one based on your hardware)
+pip install torch --index-url https://download.pytorch.org/whl/cu128  # NVIDIA RTX 50-series
+pip install torch --index-url https://download.pytorch.org/whl/cu121  # NVIDIA RTX 40-series
+pip install torch  # CPU or Apple Silicon
 
-# For NVIDIA RTX 40-series and older (CUDA 12.1)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# For CPU or Apple Silicon
-pip install torch
-
-# Install other dependencies
+# Install dependencies
 pip install sentence-transformers scikit-learn numpy
 ```
 
-📖 **Having GPU issues?** Check the comprehensive [GPU Setup Guide](docs/GPU_SETUP.md)
+> **Note**: For RTX 50-series GPUs, see the [GPU Setup Guide](docs/GPU_SETUP.md) for important compatibility information.
 
-### 2. Prepare Data
-
-Organize your training data (you'll need to provide your own training data):
-
-```
-data/
-├── human/          # Human-written texts
-│   ├── text001.txt
-│   ├── text002.txt
-│   └── ...
-├── ai/             # AI-generated texts
-│   ├── text001.txt
-│   ├── text002.txt
-│   └── ...
-└── test/           # Optional test set
-    ├── human/
-    └── ai/
-```
-
-**Note**: Training data is not included in this repository. You need to collect your own datasets of human-written and AI-generated texts.
-
-### 3. Train Model
-
-```bash
-python trustedText.py
-```
-
-Or use the module programmatically:
+### Train Your Model
 
 ```python
 from trustedText import TrustedText
@@ -72,123 +39,71 @@ detector = TrustedText()
 detector.run_full_pipeline()
 ```
 
-Output:
-```
-NVIDIA GPU detected: [GPU name]
-Using device: CUDA
-Model loaded in 15.3 seconds | Dim: 768
-...
-Model saved to models/contrastive_classifier.pt
-```
+### Detect AI Text
 
-### 4. Use Model
-
-**Option 1: Using the module**
 ```python
 from trustedText import TrustedText
 
 detector = TrustedText()
-detector.load()  # Load trained model
+detector.load()
+
 label, probability = detector.predict("Your text here")
 print(f"Prediction: {label} (AI probability: {probability:.3f})")
 ```
 
-**Option 2: Direct prediction**
-```python
-from trustedText import TrustedText
+## Features
 
-detector = TrustedText()
-detector.load()
-result = detector.analyze_text("Your text here")
-print(result)
-```
+### Core Capabilities
 
-## Training on Remote GPU Machine
+- **Contrastive Learning**: Learns discriminative representations by pulling same-class samples together
+- **Hard Negative Mining**: Automatically focuses on difficult examples during training
+- **Embeddings Cache**: Speeds up repeated training sessions
+- **Cross-Validation**: Built-in evaluation metrics and test set support
+- **Batch Processing**: Efficient inference on multiple texts
 
-See [TRANSFER_MODEL.md](docs/TRANSFER_MODEL.md) for detailed instructions on:
-- Transferring data and code to GPU machines
-- Manual SCP/rsync transfer
-- Cloud storage options (S3, GCS, etc.)
-- Downloading trained models
-- Troubleshooting and optimization
-
-## Project Structure
-
-```
-trustedText/
-├── trustedText.py        # Main library module (training & inference)
-├── main.py              # Simple entry point
-├── app/                 # Web interface
-│   ├── api.py          # FastAPI server
-│   └── index.html      # Web UI
-├── data/               # Training and test data (not included)
-│   ├── human/         # Human-written texts
-│   ├── ai/            # AI-generated texts
-│   └── test/          # Test set
-│       ├── human/
-│       └── ai/
-├── models/            # Trained models (auto-generated, not included)
-├── docs/              # Documentation
-│   ├── START.md       # Web interface usage guide
-│   ├── GPU_SETUP.md   # GPU setup instructions
-│   └── TRANSFER_MODEL.md # Model transfer guide
-└── pyproject.toml     # Project dependencies
-```
-
-## Configuration
-
-Environment variables:
-
-```bash
-# Maximum sequence length for embeddings
-export MAX_SEQ_LEN=320
-
-# Batch size for encoding (adjust based on GPU memory)
-export EMBED_BATCH_SIZE=4
-```
-
-## Model Details
+### Technical Highlights
 
 - **Embedding Model**: Qwen/Qwen3-Embedding-0.6B (768 dimensions)
-- **Classifier**: Neural network with contrastive learning
-  - 2-layer encoder with LayerNorm and dropout
-  - Projection head for contrastive embeddings
-  - Classification head for binary prediction
-- **Training Approach**: 
-  - Supervised contrastive loss + cross-entropy loss
-  - Hard negative mining to focus on difficult examples
-  - Early stopping with patience
-  - AdamW optimizer with cosine annealing
-- **Training Data**: All provided samples (no train/test split)
-- **Evaluation**: Separate test set from `data/test/`
+- **Neural Architecture**: 2-layer encoder with LayerNorm and dropout
+- **Training Strategy**: Supervised contrastive loss + cross-entropy with early stopping
+- **Optimizer**: AdamW with cosine annealing learning rate schedule
 
-## Performance
+## Documentation
 
-Training time (1000 samples):
-- NVIDIA RTX 4090: ~30 seconds
-- Apple M3 Pro: ~60 seconds
-- CPU (Intel i7): ~180 seconds
+| Guide | Description |
+|-------|-------------|
+| [Web Interface](docs/START.md) | Run the web UI for interactive detection |
+| [GPU Setup](docs/GPU_SETUP.md) | Configure NVIDIA GPUs and troubleshoot CUDA |
+| [Model Transfer](docs/TRANSFER_MODEL.md) | Train on remote GPU machines and transfer models |
 
-Model size: ~100-500 MB (depending on training data size)
+## Training Data Setup
 
-## Advanced Usage
+TrustedText requires you to provide your own training data. Organize your data as follows:
 
-### Custom Detection Threshold
-
-```python
-from trustedText import TrustedText
-
-detector = TrustedText()
-detector.load()
-
-# More conservative (fewer false positives)
-label, prob = detector.predict(text, threshold=0.7)
-
-# More aggressive (fewer false negatives)
-label, prob = detector.predict(text, threshold=0.3)
+```
+data/
+├── human/              # Human-written text files
+│   ├── text001.txt
+│   ├── text002.txt
+│   └── ...
+├── ai/                 # AI-generated text files
+│   ├── text001.txt
+│   ├── text002.txt
+│   └── ...
+└── test/              # Optional test set
+    ├── human/
+    └── ai/
 ```
 
-### Batch Inference
+**Collection Tips**:
+- Aim for 100+ samples per category
+- Include diverse sources (news, blogs, academic, social media)
+- Use UTF-8 plain text format
+- One sample per file
+
+## Usage Examples
+
+### Basic Inference
 
 ```python
 from trustedText import TrustedText
@@ -196,44 +111,91 @@ from trustedText import TrustedText
 detector = TrustedText()
 detector.load()
 
-texts = ["Text 1", "Text 2", "Text 3"]
+# Single prediction
+label, prob = detector.predict("Your text here")
+
+# With custom threshold
+label, prob = detector.predict(text, threshold=0.7)  # More conservative
+```
+
+### Batch Processing
+
+```python
+detector = TrustedText()
+detector.load()
+
+texts = ["Sample 1", "Sample 2", "Sample 3"]
 results = [detector.predict(text) for text in texts]
 
 for text, (label, prob) in zip(texts, results):
     print(f"{label}: {prob:.3f} - {text[:50]}...")
 ```
 
-### Model Configuration
+### Custom Configuration
 
 ```python
 from trustedText import TrustedText, Config
 
-# Customize model hyperparameters
 config = Config(
-    hidden_dim=512,        # Neural network hidden layer size
-    dropout=0.4,           # Dropout rate for regularization
-    epochs=100,            # Maximum training epochs
-    learning_rate=1e-3,    # Learning rate
-    contrastive_weight=0.5,  # Weight for contrastive loss
-    use_contrastive=True   # Enable contrastive learning
+    hidden_dim=512,
+    dropout=0.4,
+    epochs=100,
+    learning_rate=1e-3,
+    contrastive_weight=0.5,
+    use_contrastive=True
 )
 
 detector = TrustedText(config=config)
+detector.run_full_pipeline()
+```
+
+## Performance Benchmarks
+
+Training time for 1000 samples:
+
+| Hardware | Training Time |
+|----------|---------------|
+| NVIDIA RTX 4090 | ~30 seconds |
+| Apple M3 Pro | ~60 seconds |
+| Intel i7 CPU | ~180 seconds |
+
+Model size: 100-500 MB (varies with training data size)
+
+## Configuration
+
+Control training behavior with environment variables:
+
+```bash
+export MAX_SEQ_LEN=320          # Maximum sequence length
+export EMBED_BATCH_SIZE=4       # Batch size (adjust for GPU memory)
+```
+
+## Project Structure
+
+```
+trustedText/
+├── trustedText.py          # Core library (training & inference)
+├── main.py                 # CLI entry point
+├── app/
+│   ├── api.py             # FastAPI server
+│   └── index.html         # Web interface
+├── data/                  # Training data (not included)
+├── models/                # Trained models (auto-generated)
+└── docs/                  # Documentation
 ```
 
 ## Troubleshooting
 
 ### CUDA Not Available
 
-Check PyTorch installation:
 ```bash
 python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-If False, reinstall PyTorch with CUDA:
+If False:
 ```bash
-pip uninstall torch torchvision torchaudio
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip uninstall torch
+pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
 ### Out of Memory
@@ -241,68 +203,52 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 Reduce batch size:
 ```bash
 export EMBED_BATCH_SIZE=2
-python train.py
-```
-
-### Model File Not Found
-
-Run training first:
-```bash
 python trustedText.py
 ```
 
-Or transfer from a GPU machine (see [TRANSFER_MODEL.md](docs/TRANSFER_MODEL.md)).
+### Model Not Found
 
-## Data Collection
+Train a model first or transfer from another machine:
+```bash
+python trustedText.py  # Train locally
+```
 
-This repository does not include training data. You need to collect your own datasets.
-
-### Manual Collection
-
-1. Create text files in `data/human/` for human-written content
-2. Create text files in `data/ai/` for AI-generated content
-3. Optionally add test samples to `data/test/human/` and `data/test/ai/`
-
-**Tips:**
-- Collect diverse samples (news, blogs, academic, social media)
-- Aim for 100+ samples per category
-- Each file should contain one text sample
-- UTF-8 plain text format
-
-See `data/README.md` for detailed guidelines.
+See [Model Transfer Guide](docs/TRANSFER_MODEL.md) for remote training.
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please follow these steps:
 
 1. Fork the repository
-2. Create a feature branch
+2. Create a feature branch (`git checkout -b feature/improvement`)
 3. Make your changes
 4. Submit a pull request
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
+
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Support
-
-For issues and questions, see the documentation in the `docs/` folder:
-- [Web Interface Guide](docs/START.md) - Running the web UI
-- [GPU Setup Guide](docs/GPU_SETUP.md) - GPU configuration
-- [Model Transfer Guide](docs/TRANSFER_MODEL.md) - Transferring models between machines
-
-Or open an issue on GitHub.
-
-
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Citation
 
-If you use this codebase or otherwise find our work valuable, please cite:
+If you use TrustedText in your research or project, please cite:
 
+```bibtex
 @misc{trustedtext2026,
-      title={TrustedText: AI Text Detection using Neural Networks with Contrastive Learning},
-      author={TrustedText Contributors},
-      year={2026},
-      publisher = {GitHub},
-      howpublished = {\url{https://github.com/theoncetimes/trustedText}},
+    title={TrustedText: AI Text Detection using Neural Networks with Contrastive Learning},
+    author={TrustedText Contributors},
+    year={2026},
+    publisher={GitHub},
+    howpublished={\url{https://github.com/theoncetimes/trustedText}}
 }
+```
+
+## Support
+
+- **Documentation**: Check the [docs/](docs/) folder
+- **Issues**: [Open an issue](https://github.com/theoncetimes/trustedText/issues) on GitHub
+
+---
+
+Made with focus on accuracy, performance, and ease of use.
