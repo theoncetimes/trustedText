@@ -36,7 +36,8 @@ pip install sentence-transformers scikit-learn numpy
 from trustedText import TrustedText
 
 detector = TrustedText()
-detector.run_full_pipeline()
+detector.setup()
+detector.train()
 ```
 
 ### Detect AI Text
@@ -113,9 +114,6 @@ detector.load()
 
 # Single prediction
 label, prob = detector.predict("Your text here")
-
-# With custom threshold
-label, prob = detector.predict(text, threshold=0.7)  # More conservative
 ```
 
 ### Batch Processing
@@ -141,12 +139,12 @@ config = Config(
     dropout=0.4,
     epochs=100,
     learning_rate=1e-3,
-    contrastive_weight=0.5,
-    use_contrastive=True
+    contrastive_weight=0.5
 )
 
 detector = TrustedText(config=config)
-detector.run_full_pipeline()
+detector.setup()
+detector.train()
 ```
 
 ## Performance Benchmarks
