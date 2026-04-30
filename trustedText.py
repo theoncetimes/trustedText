@@ -102,7 +102,7 @@ class DeviceManager:
 
 
 # ────────────────────────────────────────────────
-# EMBEDDING WITH STYLE
+# EMBEDDING
 # ────────────────────────────────────────────────
 class Embedding:
     """Manages the sentence transformer model and text encoding."""
@@ -441,6 +441,20 @@ class NeuralClassifier:
 
         return predictions, ai_probs
 
+    def project(self, embeddings: np.ndarray) -> np.ndarray:
+        """Get projected embeddings from the contrastive head."""
+        if self.model is None:
+            raise RuntimeError("Model not trained")
+
+        self.model.eval()
+        X_norm = self._normalize(embeddings, fit=False)
+        X_tensor = torch.FloatTensor(X_norm).to(self.device)
+
+        with torch.no_grad():
+            # return_embedding=True returns the normalized projection
+            proj = self.model(X_tensor, return_embedding=True)
+            return proj.cpu().numpy()
+
     def save(self, path: Path, metadata: Dict[str, Any]) -> None:
         """Save model and preprocessing params."""
         if self.model is None:
@@ -729,13 +743,16 @@ class TrustedText:
         logger.info(f"\nTraining on {len(self.embeddings)} samples...")
         self.classifier.fit(self.embeddings, self.labels)
 
-    def visualize(self, method: str = "umap", max_points: int = 500) -> None:
+    def visualize(
+        self, method: str = "umap", max_points: int = 500, use_projection: bool = False
+    ) -> None:
         """
         Visualize embeddings with UMAP or t-SNE.
 
         Args:
             method: 'umap' (preferred) or 'tsne'
             max_points: Max points to plot
+            use_projection: If True, use trained model's projected embeddings
         """
         if self.embeddings is None or self.labels is None:
             raise RuntimeError("No embeddings found. Run train() first.")
@@ -749,9 +766,17 @@ class TrustedText:
             X = X[idx]
             y = y[idx]
 
+        title_suffix = " (Raw)"
+        if use_projection:
+            logger.info("Projecting embeddings through trained model...")
+            X = self.classifier.project(X)
+            title_suffix = " (Trained Projection)"
+
         logger.info(f"Computing {method} projection...")
 
+        actual_method = "t-SNE"
         if method == "umap" and UMAP_AVAILABLE:
+            actual_method = "UMAP"
             reducer = umap.UMAP(
                 n_neighbors=15,
                 min_dist=0.1,
@@ -788,7 +813,9 @@ class TrustedText:
         )
 
         plt.colorbar(scatter, label="Class (0=Human, 1=AI)")
-        plt.title(f"{method.upper()} of Embeddings (Blue=Human, Red=AI)")
+        plt.title(
+            f"{actual_method} of Embeddings{title_suffix} (Blue=Human, Red=AI)"
+        )
         plt.xlabel("Component 1")
         plt.ylabel("Component 2")
         plt.tight_layout()
@@ -944,8 +971,13 @@ if __name__ == "__main__":
     detector.setup()
     detector.train()
 
-    # Visualize with UMAP (better than t-SNE for this)
-    detector.visualize(method="umap")
+    # Visualize raw embeddings (how the base model sees it)
+    print("\nVisualizing raw embeddings...")
+    detector.visualize(method="umap", use_projection=False)
+
+    # Visualize projected embeddings (how your trained model sees it)
+    print("\nVisualizing trained projection...")
+    detector.visualize(method="umap", use_projection=True)
 
     # Evaluate if test data exists
     metrics = detector.evaluate()

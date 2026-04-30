@@ -11,7 +11,6 @@ TrustedText is a robust AI text detection system that uses deep learning to dist
 
 - **State-of-the-art Detection**: Neural architecture with contrastive learning for robust AI text identification
 - **Flexible Hardware Support**: Automatically detects and optimizes for NVIDIA CUDA, Apple MPS, or CPU
-- **Production Ready**: Train once on powerful hardware, deploy anywhere
 - **Easy to Use**: Simple API for both training and inference
 
 ## Quick Start
