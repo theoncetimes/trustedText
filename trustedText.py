@@ -191,7 +191,7 @@ class ContrastiveClassifier(nn.Module):
         # Projection head for contrastive learning
         self.projection = nn.Sequential(
             nn.Linear(hidden_dim, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
         )
 
