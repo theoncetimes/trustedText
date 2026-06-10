@@ -1,4 +1,5 @@
 import time
+import copy
 import gc
 import hashlib
 import json
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
@@ -133,6 +134,51 @@ class Embedding:
             raise RuntimeError("Model not loaded")
         return self._embedding_dim
 
+    def chunk_texts(
+        self, texts: List[str], min_chunk_tokens: int = 30
+    ) -> Tuple[List[str], np.ndarray]:
+        """
+        Split each document into token windows that fit within max_seq_len
+        (accounting for the instruction prefix).
+
+        Returns:
+            (chunks, doc_ids) where doc_ids[i] is the index in `texts`
+            that chunks[i] came from.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+
+        tokenizer = self.model.tokenizer
+        # We tokenize full documents and slice them ourselves, so the
+        # tokenizer's max-length warning does not apply here
+        tokenizer.deprecation_warnings[
+            "sequence-length-is-longer-than-the-specified-maximum"
+        ] = True
+        instr_len = len(
+            tokenizer(self.config.instruction, add_special_tokens=False)["input_ids"]
+        )
+        # Small margin for special tokens added during encoding
+        window = max(32, self.config.max_seq_len - instr_len - 8)
+
+        chunks: List[str] = []
+        doc_ids: List[int] = []
+        for doc_idx, text in enumerate(texts):
+            token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            if not token_ids:
+                continue
+            pieces = [
+                token_ids[start : start + window]
+                for start in range(0, len(token_ids), window)
+            ]
+            # Drop a tiny trailing remainder unless it's the only chunk
+            if len(pieces) > 1 and len(pieces[-1]) < min_chunk_tokens:
+                pieces = pieces[:-1]
+            for piece in pieces:
+                chunks.append(tokenizer.decode(piece, skip_special_tokens=True).strip())
+                doc_ids.append(doc_idx)
+
+        return chunks, np.asarray(doc_ids, dtype=np.int64)
+
     def encode(self, texts: List[str], show_progress: bool = False) -> np.ndarray:
         """
         Encode texts with semantic embeddings.
@@ -238,13 +284,13 @@ class NeuralClassifier:
         # Compute similarity matrix
         similarity_matrix = torch.mm(embeddings, embeddings.t()) / temperature
 
-        # Mask out self-similarity
+        # Mask out self-similarity (large finite value to avoid inf/nan in exp/log)
         mask = torch.eye(len(labels), device=labels.device).bool()
-        similarity_matrix = similarity_matrix.masked_fill(mask, -float("inf"))
+        similarity_matrix = similarity_matrix.masked_fill(mask, -1e9)
 
-        # Create positive pairs mask (same class)
+        # Create positive pairs mask (same class, excluding self)
         labels = labels.contiguous().view(-1, 1)
-        mask_pos = torch.eq(labels, labels.t()).float()
+        mask_pos = torch.eq(labels, labels.t()).float().masked_fill(mask, 0)
 
         # Compute log_prob
         exp_sim = torch.exp(similarity_matrix)
@@ -281,113 +327,97 @@ class NeuralClassifier:
 
         return np.array(hard_indices)
 
-    def validate(self, X: np.ndarray, y: np.ndarray, min_class_count: int) -> None:
-        """Stratified cross-validation."""
-        if len(X) >= 20 and min_class_count >= 2:
-            self.n_splits = min(5, min_class_count)
-            skf = StratifiedKFold(
-                n_splits=self.n_splits,
-                shuffle=True,
-                random_state=self.config.random_state,
-            )
+    def _split_by_document(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        groups: np.ndarray,
+        val_fraction: float = 0.15,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """
+        Hold out a validation set split at the document level, so chunks of
+        the same document never appear on both sides.
+        Returns None if the dataset is too small to split.
+        """
+        docs = np.unique(groups)
+        doc_labels = np.array([y[groups == d][0] for d in docs])
+        class_counts = np.bincount(doc_labels, minlength=2)
 
-            scores = []
-            for train_idx, val_idx in skf.split(X, y):
-                X_train, X_val = X[train_idx], X[val_idx]
-                y_train, y_val = y[train_idx], y[val_idx]
+        if len(docs) < 10 or class_counts.min() < 2:
+            return None
 
-                # Quick train
-                model = ContrastiveClassifier(
-                    X.shape[1], self.config.hidden_dim, self.config.dropout
-                ).to(self.device)
+        train_docs, val_docs = train_test_split(
+            docs,
+            test_size=val_fraction,
+            stratify=doc_labels,
+            random_state=self.config.random_state,
+        )
+        train_mask = np.isin(groups, train_docs)
+        return X[train_mask], y[train_mask], X[~train_mask], y[~train_mask]
 
-                optimizer = torch.optim.Adam(
-                    model.parameters(), lr=self.config.learning_rate
-                )
-                criterion = nn.CrossEntropyLoss()
+    def _train_model(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        verbose: bool = True,
+    ) -> Tuple[ContrastiveClassifier, np.ndarray, np.ndarray, float]:
+        """
+        Full training procedure (hard-negative weights + contrastive loss),
+        with early stopping on validation macro-F1.
+        Returns (model, scaler_mean, scaler_std, best_val_f1).
+        """
+        torch.manual_seed(self.config.random_state)
 
-                X_train_t = torch.FloatTensor(self._normalize(X_train, fit=True)).to(
-                    self.device
-                )
-                y_train_t = torch.LongTensor(y_train).to(self.device)
-                X_val_t = torch.FloatTensor(self._normalize(X_val, fit=False)).to(
-                    self.device
-                )
-
-                # Simple training
-                model.train()
-                for _ in range(20):  # Quick epochs for CV
-                    optimizer.zero_grad()
-                    outputs = model(X_train_t)
-                    loss = criterion(outputs, y_train_t)
-                    loss.backward()
-                    optimizer.step()
-
-                # Validation
-                model.eval()
-                with torch.no_grad():
-                    outputs = model(X_val_t)
-                    preds = torch.argmax(outputs, dim=1).cpu().numpy()
-                    f1 = precision_recall_fscore_support(
-                        y_val, preds, average="macro", zero_division=0
-                    )[2]
-                    scores.append(f1)
-
-            self.cv_scores = np.array(scores)
-            logger.info(
-                f"CV F1-macro: {self.cv_scores.mean():.3f} (±{self.cv_scores.std():.3f})"
-            )
-        else:
-            logger.info("Dataset too small for cross-validation")
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Train with contrastive learning."""
-        logger.info("Preparing data...")
-        X_norm = self._normalize(X, fit=True)
-        self.input_dim = X.shape[1]
+        mean = np.mean(X_train, axis=0)
+        std = np.std(X_train, axis=0) + 1e-8
+        X_train_norm = (X_train - mean) / std
+        X_val_norm = (X_val - mean) / std
 
         # Identify hard negatives for sampling weight
-        hard_indices = self._hard_negative_mining(X_norm, y)
+        hard_indices = self._hard_negative_mining(X_train_norm, y_train)
 
         # Create sample weights (emphasize hard examples)
-        sample_weights = np.ones(len(y))
+        sample_weights = np.ones(len(y_train))
         if len(hard_indices) > 0:
             sample_weights[hard_indices] = 2.0  # Double weight for hard examples
 
-        X_tensor = torch.FloatTensor(X_norm).to(self.device)
-        y_tensor = torch.LongTensor(y).to(self.device)
+        X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
+        y_tensor = torch.LongTensor(y_train).to(self.device)
         weights_tensor = torch.FloatTensor(sample_weights).to(self.device)
+        X_val_tensor = torch.FloatTensor(X_val_norm).to(self.device)
 
         dataset = TensorDataset(X_tensor, y_tensor, weights_tensor)
         loader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
 
-        self.model = ContrastiveClassifier(
-            X.shape[1], self.config.hidden_dim, self.config.dropout
+        model = ContrastiveClassifier(
+            X_train.shape[1], self.config.hidden_dim, self.config.dropout
         ).to(self.device)
 
         optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.config.learning_rate, weight_decay=1e-5
+            model.parameters(), lr=self.config.learning_rate, weight_decay=1e-5
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.config.epochs
         )
         criterion = nn.CrossEntropyLoss(reduction="none")
 
-        logger.info(f"Training neural classifier for {self.config.epochs} epochs...")
-        best_loss = float("inf")
+        best_f1 = -1.0
+        best_state = None
         patience = 10
         patience_counter = 0
 
         for epoch in range(self.config.epochs):
-            self.model.train()
+            model.train()
             total_loss = 0
 
             for batch_x, batch_y, batch_w in loader:
                 optimizer.zero_grad()
 
                 # Forward
-                logits = self.model(batch_x)
-                emb = self.model(batch_x, return_embedding=True)
+                logits = model(batch_x)
+                emb = model(batch_x, return_embedding=True)
 
                 # Combined loss
                 ce_loss = (criterion(logits, batch_y) * batch_w).mean()
@@ -404,22 +434,129 @@ class NeuralClassifier:
             scheduler.step()
             avg_loss = total_loss / len(loader)
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            # Early stopping on validation macro-F1
+            model.eval()
+            with torch.no_grad():
+                val_preds = torch.argmax(model(X_val_tensor), dim=1).cpu().numpy()
+            val_f1 = precision_recall_fscore_support(
+                y_val, val_preds, average="macro", zero_division=0
+            )[2]
+
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                best_state = copy.deepcopy(model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
 
-            if (epoch + 1) % 20 == 0 or patience_counter == 0:
+            if verbose and ((epoch + 1) % 20 == 0 or patience_counter == 0):
                 logger.info(
-                    f"Epoch {epoch+1}/{self.config.epochs}, Loss: {avg_loss:.4f}"
+                    f"Epoch {epoch+1}/{self.config.epochs}, "
+                    f"Loss: {avg_loss:.4f}, Val F1: {val_f1:.3f}"
                 )
 
             if patience_counter >= patience:
-                logger.info(f"Early stopping at epoch {epoch+1}")
+                if verbose:
+                    logger.info(f"Early stopping at epoch {epoch+1}")
                 break
 
-        logger.info("Training complete")
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        return model, mean, std, best_f1
+
+    def validate(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        groups: np.ndarray,
+        min_class_count: int,
+    ) -> None:
+        """
+        Document-level stratified cross-validation using the same training
+        procedure as fit(). Folds are split by document, and fold scores are
+        computed on document-level predictions (mean chunk probability).
+        """
+        docs = np.unique(groups)
+        doc_labels = np.array([y[groups == d][0] for d in docs])
+
+        if len(docs) < 20 or min_class_count < 2:
+            logger.info("Dataset too small for cross-validation")
+            return
+
+        self.n_splits = min(5, min_class_count)
+        skf = StratifiedKFold(
+            n_splits=self.n_splits,
+            shuffle=True,
+            random_state=self.config.random_state,
+        )
+
+        scores = []
+        for fold, (train_doc_idx, val_doc_idx) in enumerate(
+            skf.split(docs, doc_labels)
+        ):
+            train_mask = np.isin(groups, docs[train_doc_idx])
+            X_fold, y_fold = X[train_mask], y[train_mask]
+            groups_fold = groups[train_mask]
+
+            # Inner document-level split for early stopping
+            split = self._split_by_document(X_fold, y_fold, groups_fold)
+            if split is None:
+                split = (X_fold, y_fold, X_fold, y_fold)
+
+            model, mean, std, _ = self._train_model(*split, verbose=False)
+
+            # Score on held-out documents (aggregate chunk probs per doc)
+            model.eval()
+            val_docs = docs[val_doc_idx]
+            X_val_norm = (X[~train_mask] - mean) / std
+            val_groups = groups[~train_mask]
+            with torch.no_grad():
+                probs = F.softmax(
+                    model(torch.FloatTensor(X_val_norm).to(self.device)), dim=1
+                )[:, 1].cpu().numpy()
+
+            doc_preds = np.array(
+                [int(probs[val_groups == d].mean() >= 0.5) for d in val_docs]
+            )
+            f1 = precision_recall_fscore_support(
+                doc_labels[val_doc_idx], doc_preds, average="macro", zero_division=0
+            )[2]
+            scores.append(f1)
+            logger.info(f"CV fold {fold + 1}/{self.n_splits}: doc-level F1 {f1:.3f}")
+
+        self.cv_scores = np.array(scores)
+        logger.info(
+            f"CV F1-macro (doc-level): {self.cv_scores.mean():.3f} "
+            f"(±{self.cv_scores.std():.3f})"
+        )
+
+    def fit(
+        self, X: np.ndarray, y: np.ndarray, groups: Optional[np.ndarray] = None
+    ) -> None:
+        """Train with contrastive learning and validation-based early stopping."""
+        logger.info("Preparing data...")
+        self.input_dim = X.shape[1]
+
+        split = (
+            self._split_by_document(X, y, groups) if groups is not None else None
+        )
+        if split is None:
+            logger.warning(
+                "Too few documents for a validation split; "
+                "early stopping will use training data"
+            )
+            split = (X, y, X, y)
+        else:
+            logger.info(
+                f"Holding out {len(split[3])} chunks for validation-based early stopping"
+            )
+
+        logger.info(f"Training neural classifier for {self.config.epochs} epochs...")
+        self.model, self.scaler_mean, self.scaler_std, best_f1 = self._train_model(
+            *split
+        )
+        logger.info(f"Training complete (best val F1: {best_f1:.3f})")
 
     def predict(self, embeddings: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -556,6 +693,8 @@ class Storage:
             "files": file_stats,
             "instruction": self.config.instruction,
             "model_id": self.config.model_id,
+            "max_seq_len": self.config.max_seq_len,
+            "chunking": "v1",
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -564,8 +703,12 @@ class Storage:
 
     def load_or_create_embeddings(
         self, embedding: Embedding
-    ) -> Tuple[np.ndarray, np.ndarray, int, int]:
-        """Load embeddings from cache or create them."""
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+        """
+        Load embeddings from cache or create them.
+        Documents are split into chunks; doc_ids maps each chunk back to its
+        source document. human_count/ai_count are document counts.
+        """
         signature = self._compute_signature()
         cache_path = self.config.cache_dir / f"embeddings_{signature}.npz"
 
@@ -574,38 +717,46 @@ class Storage:
             cache = np.load(cache_path)
             embeddings = np.asarray(cache["embeddings"], dtype=np.float32)
             labels = np.asarray(cache["labels"], dtype=np.int64)
+            doc_ids = np.asarray(cache["doc_ids"], dtype=np.int64)
             human_count = int(cache["human_count"])
             ai_count = int(cache["ai_count"])
         else:
             logger.info("Loading texts from data folder...")
             human_texts, ai_texts = self.load_texts()
             all_texts = human_texts + ai_texts
-            labels = np.asarray(
+            doc_labels = np.asarray(
                 [0] * len(human_texts) + [1] * len(ai_texts), dtype=np.int64
             )
             human_count = len(human_texts)
             ai_count = len(ai_texts)
 
-            logger.info(f"Dataset stats: Human={human_count}, AI={ai_count}")
+            chunks, doc_ids = embedding.chunk_texts(all_texts)
+            labels = doc_labels[doc_ids]
+
+            logger.info(
+                f"Dataset stats: Human={human_count}, AI={ai_count} documents "
+                f"-> {len(chunks)} chunks"
+            )
             logger.info("Encoding dataset...")
 
             start_encode = time.time()
-            embeddings = embedding.encode(all_texts, show_progress=True)
+            embeddings = embedding.encode(chunks, show_progress=True)
             encode_time = time.time() - start_encode
-            logger.info(f"Encoded {len(all_texts)} texts in {encode_time:.1f}s")
+            logger.info(f"Encoded {len(chunks)} chunks in {encode_time:.1f}s")
 
             np.savez_compressed(
                 cache_path,
                 embeddings=embeddings,
                 labels=labels,
+                doc_ids=doc_ids,
                 human_count=human_count,
                 ai_count=ai_count,
             )
 
-            del human_texts, ai_texts, all_texts
+            del human_texts, ai_texts, all_texts, chunks
             gc.collect()
 
-        return embeddings, labels, human_count, ai_count
+        return embeddings, labels, doc_ids, human_count, ai_count
 
 
 # ────────────────────────────────────────────────
@@ -639,11 +790,21 @@ class Evaluation:
         return texts, labels, len(human_texts), len(ai_texts)
 
     def evaluate(self, classifier, embedding, texts, true_labels):
-        """Comprehensive evaluation."""
-        logger.info(f"Encoding {len(texts)} test samples...")
-        test_embeddings = embedding.encode(texts, show_progress=False)
+        """Comprehensive evaluation. Predicts per chunk, aggregates per document."""
+        chunks, doc_ids = embedding.chunk_texts(texts)
+        logger.info(f"Encoding {len(texts)} test samples ({len(chunks)} chunks)...")
+        test_embeddings = embedding.encode(chunks, show_progress=False)
 
-        predictions, ai_probs = classifier.predict(test_embeddings)
+        _, chunk_probs = classifier.predict(test_embeddings)
+
+        # Mean chunk probability per document
+        ai_probs = np.array(
+            [
+                chunk_probs[doc_ids == i].mean() if np.any(doc_ids == i) else 0.5
+                for i in range(len(texts))
+            ]
+        )
+        predictions = (ai_probs >= 0.5).astype(int)
 
         accuracy = accuracy_score(true_labels, predictions)
         precision, recall, f1, support = precision_recall_fscore_support(
@@ -720,6 +881,7 @@ class TrustedText:
 
         self.embeddings: Optional[np.ndarray] = None
         self.labels: Optional[np.ndarray] = None
+        self.doc_ids: Optional[np.ndarray] = None
         self.human_count: int = 0
         self.ai_count: int = 0
 
@@ -731,17 +893,22 @@ class TrustedText:
         """Execute full training pipeline."""
         logger.info("Preparing dataset...")
 
-        self.embeddings, self.labels, self.human_count, self.ai_count = (
+        self.embeddings, self.labels, self.doc_ids, self.human_count, self.ai_count = (
             self.storage.load_or_create_embeddings(self.embedding)
         )
 
-        logger.info(f"Dataset ready: Human={self.human_count}, AI={self.ai_count}")
+        logger.info(
+            f"Dataset ready: Human={self.human_count}, AI={self.ai_count} documents "
+            f"({len(self.embeddings)} chunks)"
+        )
 
         min_class_count = min(self.human_count, self.ai_count)
-        self.classifier.validate(self.embeddings, self.labels, min_class_count)
+        self.classifier.validate(
+            self.embeddings, self.labels, self.doc_ids, min_class_count
+        )
 
-        logger.info(f"\nTraining on {len(self.embeddings)} samples...")
-        self.classifier.fit(self.embeddings, self.labels)
+        logger.info(f"\nTraining on {len(self.embeddings)} chunks...")
+        self.classifier.fit(self.embeddings, self.labels, self.doc_ids)
 
     def visualize(
         self, method: str = "umap", max_points: int = 500, use_projection: bool = False
@@ -933,17 +1100,25 @@ class TrustedText:
     def predict(
         self, text: str, return_prob: bool = True
     ) -> Union[str, Tuple[str, float]]:
-        """Detect if text is AI-generated."""
+        """Detect if text is AI-generated (mean probability over chunks)."""
         if self.classifier.model is None:
             raise RuntimeError("No trained model available.")
 
-        emb = self.embedding.encode([text])
-        predictions, probs = self.classifier.predict(emb)
+        if self.embedding.model is None:
+            self.embedding.load()
 
-        label = "AI" if predictions[0] == 1 else "Human"
+        chunks, _ = self.embedding.chunk_texts([text])
+        if not chunks:
+            raise ValueError("Text is empty")
+
+        emb = self.embedding.encode(chunks)
+        _, probs = self.classifier.predict(emb)
+        ai_prob = float(np.mean(probs))
+
+        label = "AI" if ai_prob >= 0.5 else "Human"
 
         if return_prob:
-            return label, float(probs[0])
+            return label, ai_prob
         return label
 
     def analyze_text(self, text: str) -> Dict[str, Any]:
