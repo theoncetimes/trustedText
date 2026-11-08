@@ -1,0 +1,38 @@
+name = "holdout_test"
+description = "Train on data/, evaluate once on the fixed held-out set in data/test/."
+seeds = [0, 1, 2]
+
+[data]
+dir = "data"
+test_dir = "data/test"
+clean = true
+
+[split]
+type = "holdout"
+
+[evaluation]
+reference = "char_tfidf"
+n_bootstrap = 1000
+
+[[detectors]]
+name = "char_tfidf"
+type = "tfidf"
+analyzer = "char_wb"
+ngram_range = [2, 5]
+
+[[detectors]]
+name = "qwen_embedding_lr"
+type = "embedding_lr"
+
+[[detectors]]
+name = "trustedtext_contrastive"
+type = "contrastive"
+
+[[detectors]]
+name = "fast_detectgpt"
+type = "zeroshot"
+feature = "fast_detectgpt"
+
+[[detectors]]
+name = "binoculars"
+type = "binoculars"

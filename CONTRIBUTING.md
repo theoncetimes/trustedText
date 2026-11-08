@@ -46,13 +46,13 @@ If you find a bug or have a feature request:
 5. **Test Your Changes**
    ```bash
    # Test training pipeline
-   python trustedText.py
+   python -m trustedtext.train
    
    # Test inference
    python scripts/load_model.py
    
    # Test API
-   cd app && python api.py
+   python app/api.py
    ```
 
 6. **Commit Your Changes**

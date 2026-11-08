@@ -1,0 +1,50 @@
+name = "zeroshot_cv"
+description = """
+Zero-shot detectors scored with Qwen2.5-0.5B (Binoculars: base as observer,
+Instruct as performer). Training folds are only used to calibrate P(AI), so
+AUROC is unaffected by the split. Small scoring models are a cheap proxy;
+the original papers use 2.7B-7B models.
+"""
+seeds = [0, 1, 2]
+
+[data]
+dir = "data"
+clean = true
+
+[split]
+type = "kfold"
+n_splits = 5
+
+[evaluation]
+reference = "char_tfidf"
+n_bootstrap = 1000
+
+[[detectors]]
+name = "char_tfidf"
+type = "tfidf"
+analyzer = "char_wb"
+ngram_range = [2, 5]
+
+[[detectors]]
+name = "log_likelihood"
+type = "zeroshot"
+feature = "log_likelihood"
+
+[[detectors]]
+name = "log_rank"
+type = "zeroshot"
+feature = "log_rank"
+
+[[detectors]]
+name = "entropy"
+type = "zeroshot"
+feature = "entropy"
+
+[[detectors]]
+name = "fast_detectgpt"
+type = "zeroshot"
+feature = "fast_detectgpt"
+
+[[detectors]]
+name = "binoculars"
+type = "binoculars"

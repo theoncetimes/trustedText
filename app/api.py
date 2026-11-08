@@ -1,24 +1,17 @@
-import sys
 import time
-import os
 from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import torch
-import numpy as np
-from sentence_transformers import SentenceTransformer
+
+from trustedtext import TrustedText
 
 project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
 
-from trustedText import ContrastiveClassifier  # noqa: E402
-
-# Initialize FastAPI
 app = FastAPI(title="TrustedText API", version="1.0.0")
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,17 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables
-model = None
-classifier_model = None
-scaler_mean = None
-scaler_std = None
-instruction = None
-hyperparams = {}
-metadata = {}
+detector: TrustedText | None = None
 
 
-# Request/Response models
 class TextRequest(BaseModel):
     text: str
 
@@ -51,144 +36,23 @@ class DetectionResponse(BaseModel):
 
 @app.on_event("startup")
 async def load_model():
-    """Load the trained neural model on startup"""
-    global model, classifier_model, scaler_mean, scaler_std, instruction, hyperparams, metadata
+    """Load the trained classifier and its embedding model on startup."""
+    global detector
 
-    print("Loading model...")
-
-    # Device detection: CUDA (NVIDIA) → MPS (Apple) → CPU
-    if torch.cuda.is_available():
-        device = "cuda"
-        print(f"NVIDIA GPU detected: {torch.cuda.get_device_name(0)}")
-    elif torch.backends.mps.is_available():
-        device = "mps"
-        print("Apple GPU (MPS) detected")
-    else:
-        device = "cpu"
-        print("No GPU detected, using CPU")
-
-    print(f"Using device: {device.upper()}")
-
-    # Load trained neural model (.pt file) saved by trustedText.py
     model_path = project_root / "models" / "contrastive_classifier.pt"
-
     if not model_path.exists():
-        # Fallback to old pickle format for backward compatibility
-        old_model_path = project_root / "models" / "knn_classifier.pkl"
-        if old_model_path.exists():
-            raise RuntimeError(
-                f"Found old KNN model at {old_model_path} but this API requires the new neural model. "
-                f"Please run 'python trustedText.py' to train and save the new contrastive model."
-            )
         raise RuntimeError(
-            f"Trained model not found at {model_path}. Please run 'python trustedText.py' to train and save the model first."
+            f"Trained model not found at {model_path}. "
+            "Run 'python -m trustedtext.train' to train and save the model first."
         )
 
-    print(f"Loading trained neural classifier from {model_path}...")
-
-    # Load checkpoint (weights_only=False since we trust our own checkpoint file)
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-
-    # Restore preprocessing parameters
-    scaler_mean = checkpoint["scaler_mean"]
-    scaler_std = checkpoint["scaler_std"]
-    hyperparams = checkpoint["hyperparams"]
-    metadata = {
-        "human_count": checkpoint.get("human_count", 0),
-        "ai_count": checkpoint.get("ai_count", 0),
-    }
-
-    saved_config = checkpoint.get("config", {})
-    instruction = saved_config.get(
-        "instruction",
-        checkpoint.get(
-            "instruction",
-            "Analyze the writing style, punctuation patterns, lexical diversity, and sentence rhythm. \n"
-            "Distinguish between human text (natural variability, inconsistent flow) and AI text (uniform structure, predictable patterns).\n"
-            "Text: ",
-        ),
-    )
-    model_id = saved_config.get(
-        "model_id", checkpoint.get("model_id", "Qwen/Qwen3-Embedding-0.6B")
-    )
-    max_seq_len = int(
-        saved_config.get(
-            "max_seq_len",
-            checkpoint.get("max_seq_length", os.getenv("MAX_SEQ_LEN", "320")),
-        )
-    )
-
-    # Reconstruct and load neural classifier
-    classifier_model = ContrastiveClassifier(
-        input_dim=hyperparams["input_dim"],
-        hidden_dim=hyperparams["hidden_dim"],
-        dropout=hyperparams["dropout"],
-    ).to(device)
-
-    # Load state dict
-    state_dict = checkpoint["model_state"]
-    classifier_model.load_state_dict(state_dict)
-    classifier_model.eval()
-
+    detector = TrustedText()
+    detector.load(model_path)
+    detector.setup()
     print(
-        f"Neural classifier loaded: {hyperparams['input_dim']}D input -> {hyperparams['hidden_dim']}D hidden"
+        f"Model loaded. Training samples: "
+        f"{detector.human_count} human, {detector.ai_count} AI"
     )
-
-    # Load embedding model
-    model = SentenceTransformer(
-        model_id,
-        device=device,
-        trust_remote_code=True,
-    )
-    model.max_seq_length = max_seq_len
-
-    print("Model loaded successfully")
-    print(
-        f"Training samples: {metadata.get('human_count', 0)} human, {metadata.get('ai_count', 0)} AI"
-    )
-
-
-def encode_text(text: str):
-    """Encode text with semantic embeddings"""
-    # Semantic embedding
-    prompt = instruction + text
-    semantic_emb = model.encode(
-        [prompt], normalize_embeddings=True, convert_to_tensor=False
-    )
-    semantic_emb = np.array(semantic_emb, dtype=np.float32)
-
-    return semantic_emb[0]
-
-
-def predict_text(text: str):
-    """Make prediction on text"""
-    if classifier_model is None or model is None:
-        raise RuntimeError("Model not loaded")
-
-    # Encode
-    features = encode_text(text)
-    features_norm = (features - scaler_mean) / scaler_std
-
-    # Predict
-    device = next(classifier_model.parameters()).device
-    x = torch.FloatTensor(features_norm).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        logits = classifier_model(x)
-        probs = torch.softmax(logits, dim=1)
-        ai_prob = float(probs[0][1])
-        prediction = 1 if ai_prob >= 0.5 else 0
-
-    return {
-        "label": "AI" if prediction == 1 else "Human",
-        "ai_probability": ai_prob,
-        "human_probability": 1 - ai_prob,
-        "confidence": (
-            "High"
-            if abs(ai_prob - 0.5) > 0.4
-            else "Medium" if abs(ai_prob - 0.5) > 0.2 else "Low"
-        ),
-    }
 
 
 @app.get("/")
@@ -203,20 +67,22 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint"""
+    loaded = detector is not None
+    human = detector.human_count if loaded else 0
+    ai = detector.ai_count if loaded else 0
     return {
         "status": "healthy",
-        "model_loaded": model is not None and classifier_model is not None,
-        "training_samples": {
-            "human": metadata.get("human_count", 0),
-            "ai": metadata.get("ai_count", 0),
-            "total": metadata.get("human_count", 0) + metadata.get("ai_count", 0),
-        },
+        "model_loaded": loaded,
+        "training_samples": {"human": human, "ai": ai, "total": human + ai},
     }
 
 
 @app.post("/detect", response_model=DetectionResponse)
 async def detect_text(request: TextRequest):
     """Detect if text is AI-generated"""
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
@@ -228,17 +94,16 @@ async def detect_text(request: TextRequest):
     start_time = time.time()
 
     try:
-        result = predict_text(request.text)
-        processing_time = (time.time() - start_time) * 1000
-
-        return DetectionResponse(
-            label=result["label"],
-            ai_probability=round(result["ai_probability"], 4),
-            confidence=result["confidence"],
-            processing_time_ms=round(processing_time, 2),
-        )
+        result = detector.analyze_text(request.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
+    return DetectionResponse(
+        label=result["prediction"],
+        ai_probability=round(result["ai_probability"], 4),
+        confidence=result["confidence"],
+        processing_time_ms=round((time.time() - start_time) * 1000, 2),
+    )
 
 
 if __name__ == "__main__":
