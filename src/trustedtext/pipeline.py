@@ -22,27 +22,13 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
     confusion_matrix,
 )
-from sklearn.manifold import TSNE
 from sklearn.neighbors import NearestNeighbors
-import matplotlib.pyplot as plt
 from dotenv import load_dotenv
-
-# Optional: UMAP for better visualization
-try:
-    import umap
-
-    UMAP_AVAILABLE = True
-except ImportError:
-    UMAP_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-
-if not UMAP_AVAILABLE:
-    logger.warning("UMAP not installed. Install with: pip install umap-learn")
 
 
 @dataclass
@@ -73,6 +59,7 @@ Text: """
         0.5  # Weight for contrastive loss vs classification loss
     )
     temperature: float = 0.1  # For contrastive loss
+    hard_negative_weight: float = 2.0  # Loss weight for hard examples; 1.0 disables
 
     def __post_init__(self):
         load_dotenv()
@@ -375,13 +362,12 @@ class NeuralClassifier:
         X_train_norm = (X_train - mean) / std
         X_val_norm = (X_val - mean) / std
 
-        # Identify hard negatives for sampling weight
-        hard_indices = self._hard_negative_mining(X_train_norm, y_train)
-
         # Create sample weights (emphasize hard examples)
         sample_weights = np.ones(len(y_train))
-        if len(hard_indices) > 0:
-            sample_weights[hard_indices] = 2.0  # Double weight for hard examples
+        if self.config.hard_negative_weight != 1.0:
+            hard_indices = self._hard_negative_mining(X_train_norm, y_train)
+            if len(hard_indices) > 0:
+                sample_weights[hard_indices] = self.config.hard_negative_weight
 
         X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
         y_tensor = torch.LongTensor(y_train).to(self.device)
@@ -618,7 +604,8 @@ class NeuralClassifier:
 
     def load(self, path: Path) -> Dict[str, Any]:
         """Load model."""
-        checkpoint = torch.load(path, map_location=self.device)
+        # Checkpoints contain numpy arrays, which weights_only=True rejects
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         # Reconstruct model
         hp = checkpoint["hyperparams"]
@@ -939,10 +926,18 @@ class TrustedText:
             X = self.classifier.project(X)
             title_suffix = " (Trained Projection)"
 
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+
+        try:
+            import umap
+        except ImportError:
+            umap = None
+
         logger.info(f"Computing {method} projection...")
 
         actual_method = "t-SNE"
-        if method == "umap" and UMAP_AVAILABLE:
+        if method == "umap" and umap is not None:
             actual_method = "UMAP"
             reducer = umap.UMAP(
                 n_neighbors=15,
@@ -953,7 +948,9 @@ class TrustedText:
             )
         else:
             if method == "umap":
-                logger.warning("UMAP not available, falling back to t-SNE")
+                logger.warning(
+                    "UMAP not available (pip install umap-learn), falling back to t-SNE"
+                )
 
             # Fix: Removed n_iter parameter (not valid in newer sklearn versions)
             reducer = TSNE(
@@ -1095,7 +1092,15 @@ class TrustedText:
         if not path.exists():
             raise FileNotFoundError(f"No model found at {path}")
 
-        self.classifier.load(path)
+        checkpoint = self.classifier.load(path)
+
+        # Inference must embed text exactly as it was embedded during training
+        saved = checkpoint.get("config", {})
+        for key in ("instruction", "model_id", "max_seq_len"):
+            if key in saved:
+                setattr(self.config, key, saved[key])
+        self.human_count = int(checkpoint.get("human_count", 0))
+        self.ai_count = int(checkpoint.get("ai_count", 0))
 
     def predict(
         self, text: str, return_prob: bool = True
@@ -1135,39 +1140,3 @@ class TrustedText:
                 else "Medium" if abs(prob - 0.5) > 0.2 else "Low"
             ),
         }
-
-
-if __name__ == "__main__":
-    # Configuration
-    config = Config(epochs=100, hidden_dim=512)
-
-    # Initialize and train
-    detector = TrustedText(config)
-    detector.setup()
-    detector.train()
-
-    # Visualize raw embeddings (how the base model sees it)
-    print("\nVisualizing raw embeddings...")
-    detector.visualize(method="umap", use_projection=False)
-
-    # Visualize projected embeddings (how your trained model sees it)
-    print("\nVisualizing trained projection...")
-    detector.visualize(method="umap", use_projection=True)
-
-    # Evaluate if test data exists
-    metrics = detector.evaluate()
-
-    # Save model
-    detector.save()
-
-    # Save stats to cache for visualize_stats.py
-    detector.save_stats(test_metrics=metrics)
-
-    # Example inference
-    sample_text = "ok you are clever honestly. But you forgot who am I. I am Big Kimi(evil smile) so my O is too big that occupy your position. I am sorry about that."
-    result = detector.predict(sample_text)
-    print(f"\nPrediction: {result}")
-
-    # Detailed analysis
-    analysis = detector.analyze_text(sample_text)
-    print(f"\nAnalysis: {json.dumps(analysis, indent=2)}")

@@ -1,250 +1,171 @@
 # TrustedText
 
-> High-performance AI text detection using neural networks with contrastive learning
+A research codebase for detecting machine-generated text. It contains:
+
+- **A detector**: a small MLP trained with cross-entropy plus supervised
+  contrastive loss on [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
+  chunk embeddings (1024-d), with a FastAPI demo.
+- **A benchmark harness** (`trustedtext.bench`) that evaluates that detector
+  against standard supervised and zero-shot baselines under document-level
+  splits, with confidence intervals and paired significance tests.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 
-TrustedText is a robust AI text detection system that uses deep learning to distinguish between human-written and AI-generated content. Built with neural networks and contrastive learning, it provides accurate detection with support for NVIDIA GPUs, Apple Silicon, and CPU training.
+## Status
 
-## Why TrustedText?
+The current corpus is small (42 human and 36 AI news articles, plus an
+11-document test set) and is not distributed with the repository. Results on
+it have wide confidence intervals and should be read as a pilot, not as
+evidence that any detector works in general. See
+[Limitations](#limitations).
 
-- **State-of-the-art Detection**: Neural architecture with contrastive learning for robust AI text identification
-- **Flexible Hardware Support**: Automatically detects and optimizes for NVIDIA CUDA, Apple MPS, or CPU
-- **Easy to Use**: Simple API for both training and inference
-
-## Quick Start
-
-### Installation
+## Installation
 
 ```bash
-# Install PyTorch (choose one based on your hardware)
-pip install torch --index-url https://download.pytorch.org/whl/cu128  # NVIDIA RTX 50-series
-pip install torch --index-url https://download.pytorch.org/whl/cu121  # NVIDIA RTX 40-series
-pip install torch  # CPU or Apple Silicon
-
-# Install dependencies
-pip install sentence-transformers scikit-learn numpy
+uv sync                # or: pip install -e . && pip install pytest
+uv run pytest          # unit tests for splits, metrics and data loading
 ```
 
-> **Note**: For RTX 50-series GPUs, see the [GPU Setup Guide](docs/GPU_SETUP.md) for important compatibility information.
+## Data
 
-### Train Your Model
-
-```python
-from trustedText import TrustedText
-
-detector = TrustedText()
-detector.setup()
-detector.train()
-```
-
-### Detect AI Text
-
-```python
-from trustedText import TrustedText
-
-detector = TrustedText()
-detector.load()
-
-label, probability = detector.predict("Your text here")
-print(f"Prediction: {label} (AI probability: {probability:.3f})")
-```
-
-## Features
-
-### Core Capabilities
-
-- **Contrastive Learning**: Learns discriminative representations by pulling same-class samples together
-- **Hard Negative Mining**: Automatically focuses on difficult examples during training
-- **Embeddings Cache**: Speeds up repeated training sessions
-- **Cross-Validation**: Built-in evaluation metrics and test set support
-- **Batch Processing**: Efficient inference on multiple texts
-
-### Technical Highlights
-
-- **Embedding Model**: Qwen/Qwen3-Embedding-0.6B (768 dimensions)
-- **Neural Architecture**: 2-layer encoder with LayerNorm and dropout
-- **Training Strategy**: Supervised contrastive loss + cross-entropy with early stopping
-- **Optimizer**: AdamW with cosine annealing learning rate schedule
-
-## Documentation
-
-| Guide | Description |
-|-------|-------------|
-| [Web Interface](docs/START.md) | Run the web UI for interactive detection |
-| [GPU Setup](docs/GPU_SETUP.md) | Configure NVIDIA GPUs and troubleshoot CUDA |
-| [Model Transfer](docs/TRANSFER_MODEL.md) | Train on remote GPU machines and transfer models |
-
-## Training Data Setup
-
-TrustedText requires you to provide your own training data. Organize your data as follows:
+One document per UTF-8 `.txt` file. The filename prefix records the source,
+which the benchmark uses for per-source analysis and leave-one-group-out
+splits: `claude003.txt` belongs to generator `claude`, `reuters001.txt` to
+outlet `reuters`.
 
 ```
 data/
-├── human/              # Human-written text files
-│   ├── text001.txt
-│   ├── text002.txt
-│   └── ...
-├── ai/                 # AI-generated text files
-│   ├── text001.txt
-│   ├── text002.txt
-│   └── ...
-└── test/              # Optional test set
+├── human/   # human-written documents, e.g. reuters001.txt
+├── ai/      # machine-generated documents, e.g. gpt001.txt
+└── test/    # optional fixed held-out set with the same structure
     ├── human/
     └── ai/
 ```
 
-**Collection Tips**:
-- Aim for 100+ samples per category
-- Include diverse sources (news, blogs, academic, social media)
-- Use UTF-8 plain text format
-- One sample per file
+By default the benchmark strips artifacts that reveal where a text was copied
+from rather than how it was written (zero-width characters, markdown
+emphasis, headings and links); set `clean = false` in a config to disable this.
 
-## Usage Examples
+Tools for collecting data live in `scripts/` (`add_data.py` for pasting
+samples, `generate_content.py` for generating AI text through OpenRouter).
 
-### Basic Inference
+## Running experiments
+
+Each experiment is a TOML file in `configs/`:
+
+| Config | Question |
+|---|---|
+| `quick.toml` | Smoke test with TF-IDF baselines (seconds) |
+| `supervised_cv.toml` | In-distribution comparison of supervised detectors |
+| `zeroshot_cv.toml` | Zero-shot detectors: likelihood, log-rank, entropy, Fast-DetectGPT, Binoculars |
+| `leave_one_generator_out.toml` | Generalization to an unseen AI generator |
+| `leave_one_outlet_out.toml` | False positives on an unseen human source |
+| `ablation_contrastive.toml` | Which components of the TrustedText classifier matter |
+| `holdout_test.toml` | Train on `data/`, evaluate on `data/test/` |
+
+```bash
+uv run trustedtext-bench configs/supervised_cv.toml
+uv run trustedtext-bench configs/zeroshot_cv.toml --only fast_detectgpt,binoculars
+```
+
+Each run writes to `results/<name>/<timestamp>/`:
+
+- `summary.md` / `summary.csv`: metrics per detector
+- `per_group.csv`: accuracy per generator and per outlet
+- `predictions.csv`: every test prediction, for re-analysis
+- `config.toml`, `run_info.json`: exact config, git commit and package versions
+
+### Evaluation protocol
+
+- **Document-level splits.** Long documents are split into chunks for the
+  embedding-based detectors, but every split assigns whole documents, so
+  chunks of one document never appear on both sides.
+- **Repeated seeds.** Splits and model initialization are repeated over the
+  configured seeds; metrics are averaged over seeds.
+- **Metrics.** AUROC; TPR at 1% and 5% FPR (the operating points that matter
+  when false accusations are costly); macro-F1 and accuracy at P(AI) = 0.5;
+  expected calibration error.
+- **Uncertainty.** 95% confidence intervals from a stratified bootstrap over
+  documents (all seeds of a document are resampled together). Each detector is
+  compared with a reference detector by a paired bootstrap test on AUROC.
+- **No tuning on test data.** Linear-model regularization is chosen by inner
+  cross-validation on the training fold. Zero-shot detectors use the training
+  fold only to calibrate P(AI); their AUROC does not depend on training data.
+
+### Detectors
+
+| Type | Description |
+|---|---|
+| `tfidf` | Word or character n-gram TF-IDF + logistic regression |
+| `embedding_lr` | Logistic regression on mean Qwen3 chunk embeddings |
+| `contrastive` | The TrustedText classifier (`trustedtext.pipeline`) |
+| `zeroshot` | Log-likelihood, log-rank, entropy, or Fast-DetectGPT ([Bao et al., 2024](https://arxiv.org/abs/2310.05130)) under one causal LM |
+| `binoculars` | Binoculars ([Hans et al., 2024](https://arxiv.org/abs/2401.12070)) with an observer/performer model pair |
+
+Zero-shot detectors default to Qwen2.5-0.5B (base, plus Instruct as the
+Binoculars performer). The original papers use 2.7B–7B models, so these
+numbers are a lower bound on those methods.
+
+To add a detector, subclass `Detector` in `src/trustedtext/bench/detectors.py`,
+implement `fit` and `predict`, and register it in `DETECTOR_TYPES`.
+
+## Training and serving the TrustedText model
+
+```bash
+uv run trustedtext-train               # trains on data/, evaluates on data/test/, saves models/
+uv run trustedtext-train --visualize   # also plots raw vs. projected embeddings
+uv run python app/api.py               # web UI and API on http://localhost:8000
+```
 
 ```python
-from trustedText import TrustedText
+from trustedtext import TrustedText
 
 detector = TrustedText()
 detector.load()
-
-# Single prediction
-label, prob = detector.predict("Your text here")
+label, ai_probability = detector.predict("Your text here")
 ```
 
-### Batch Processing
+Long inputs are split into chunks and the AI probability is averaged over
+chunks, both in the library and in the API.
 
-```python
-detector = TrustedText()
-detector.load()
+Environment variables `MAX_SEQ_LEN` (default 320) and `EMBED_BATCH_SIZE`
+(default 4) control embedding for training.
 
-texts = ["Sample 1", "Sample 2", "Sample 3"]
-results = [detector.predict(text) for text in texts]
-
-for text, (label, prob) in zip(texts, results):
-    print(f"{label}: {prob:.3f} - {text[:50]}...")
-```
-
-### Custom Configuration
-
-```python
-from trustedText import TrustedText, Config
-
-config = Config(
-    hidden_dim=512,
-    dropout=0.4,
-    epochs=100,
-    learning_rate=1e-3,
-    contrastive_weight=0.5
-)
-
-detector = TrustedText(config=config)
-detector.setup()
-detector.train()
-```
-
-## Performance Benchmarks
-
-Training time for 1000 samples:
-
-| Hardware | Training Time |
-|----------|---------------|
-| NVIDIA RTX 5060(CUDA) | ~30 seconds |
-| Apple M3 Pro(MPS) | ~60 seconds |
-
-Model size: 100-500 MB (varies with training data size)
-
-## Configuration
-
-Control training behavior with environment variables:
-
-```bash
-export MAX_SEQ_LEN=320          # Maximum sequence length
-export EMBED_BATCH_SIZE=4       # Batch size (adjust for GPU memory)
-```
-
-## Project Structure
+## Project structure
 
 ```
-trustedText/
-├── trustedText.py          # Core library (training & inference)
-├── main.py                 # CLI entry point
-├── app/
-│   ├── api.py             # FastAPI server
-│   └── index.html         # Web interface
-├── data/                  # Training data (not included)
-├── models/                # Trained models (auto-generated)
-└── docs/                  # Documentation
+src/trustedtext/
+├── pipeline.py        # TrustedText detector: embedding, contrastive classifier, training
+├── train.py           # training CLI
+└── bench/
+    ├── data.py        # corpus loading, source metadata, artifact cleaning
+    ├── splits.py      # k-fold, leave-one-group-out, holdout
+    ├── detectors.py   # detector interface and implementations
+    ├── resources.py   # cached embedding model and causal-LM scorers
+    ├── metrics.py     # AUROC, TPR@FPR, calibration, document bootstrap
+    └── runner.py      # experiment CLI
+configs/               # experiment definitions
+tests/                 # unit tests
+app/                   # FastAPI server and web UI
+scripts/               # data collection utilities
 ```
 
-## Troubleshooting
+## Limitations
 
-### CUDA Not Available
-
-```bash
-python -c "import torch; print(torch.cuda.is_available())"
-```
-
-If False:
-```bash
-pip uninstall torch
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-```
-
-### Out of Memory
-
-Reduce batch size:
-```bash
-export EMBED_BATCH_SIZE=2
-python trustedText.py
-```
-
-### Model Not Found
-
-Train a model first or transfer from another machine:
-```bash
-python trustedText.py  # Train locally
-```
-
-See [Model Transfer Guide](docs/TRANSFER_MODEL.md) for remote training.
-
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/improvement`)
-3. Make your changes
-4. Submit a pull request
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
+- **Small corpus.** With about 80 documents, a single misclassified document
+  moves accuracy by several points; rely on the confidence intervals.
+- **Narrow domain.** Human texts are professional news articles and AI texts
+  are LLM-generated news, so results may not transfer to essays, chat,
+  social media or other languages.
+- **Source confounds.** Human and AI documents differ in topic, outlet and
+  formatting, so detectors may learn those instead of authorship. Topic-matched
+  generation (prompting each model with a human article's headline and key
+  facts) would remove most of this.
+- **Label purity.** Recent human-published news may itself be AI-assisted;
+  documents published before November 2022 are a safer human baseline.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Citation
-
-If you use TrustedText in your research or project, please cite:
-
-```bibtex
-@misc{trustedtext2026,
-    title={TrustedText: AI Text Detection using Neural Networks with Contrastive Learning},
-    author={Timmy Wu and Matthew Hung},
-    year={2026},
-    publisher={GitHub},
-    howpublished={\url{https://github.com/theoncetimes/trustedText}}
-}
-```
-
-## Support
-
-- **Documentation**: Check the [docs/](docs/) folder
-- **Issues**: [Open an issue](https://github.com/theoncetimes/trustedText/issues) on GitHub
-
----
-
-Made with focus on accuracy, performance, and ease of use.
+MIT; see [LICENSE](LICENSE). Check the terms of the sources you collect text
+from before redistributing any data.

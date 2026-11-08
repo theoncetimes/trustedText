@@ -1,0 +1,28 @@
+# Smoke test: no neural models, runs in seconds.
+name = "quick"
+description = "TF-IDF baselines, 5-fold document-level CV, one seed."
+seeds = [0]
+
+[data]
+dir = "data"
+clean = true
+
+[split]
+type = "kfold"
+n_splits = 5
+
+[evaluation]
+reference = "char_tfidf"
+n_bootstrap = 200
+
+[[detectors]]
+name = "word_tfidf"
+type = "tfidf"
+analyzer = "word"
+ngram_range = [1, 2]
+
+[[detectors]]
+name = "char_tfidf"
+type = "tfidf"
+analyzer = "char_wb"
+ngram_range = [2, 5]

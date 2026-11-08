@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv
@@ -14,7 +15,7 @@ data/
 data_old/
 models/
 
-# Scripts
-scripts/
+# Benchmark outputs (force-add the runs a paper reports)
+results/
 
 .env

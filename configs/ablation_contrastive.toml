@@ -1,0 +1,47 @@
+name = "ablation_contrastive"
+description = """
+Which parts of the TrustedText classifier matter? Each variant removes one
+component from the full model; all share the same embeddings and splits.
+"""
+seeds = [0, 1, 2]
+
+[data]
+dir = "data"
+clean = true
+
+[split]
+type = "kfold"
+n_splits = 5
+
+[evaluation]
+reference = "full"
+n_bootstrap = 1000
+
+[[detectors]]
+name = "full"
+type = "contrastive"
+
+[[detectors]]
+name = "no_contrastive_loss"
+type = "contrastive"
+contrastive_weight = 0.0
+
+[[detectors]]
+name = "no_hard_negatives"
+type = "contrastive"
+hard_negative_weight = 1.0
+
+[[detectors]]
+name = "cross_entropy_only"
+type = "contrastive"
+contrastive_weight = 0.0
+hard_negative_weight = 1.0
+
+[[detectors]]
+name = "no_instruction"
+type = "contrastive"
+instruction = ""
+
+[[detectors]]
+name = "linear_probe"
+type = "embedding_lr"
